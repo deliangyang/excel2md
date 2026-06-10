@@ -396,10 +396,13 @@ def main():
         rel = os.path.relpath(fp, root)
         sub_dir = safe_path(str(Path(rel).parent))  # Excel 所在子目录，空格→_
         print(f"  处理: {rel}")
-        entries, skipped = process_excel(fp, out, sub_dir)
-        if skipped:
-            print(f"    跳过页头: {', '.join(skipped)}")
-        all_entries.extend(entries)
+        try:
+            entries, skipped = process_excel(fp, out, sub_dir)
+            if skipped:
+                print(f"    跳过页头: {', '.join(skipped)}")
+            all_entries.extend(entries)
+        except Exception as e:
+            print(f"    ⚠ 跳过文件 (无法打开): {e}")
 
     write_index(all_entries, version, out)
     print(f"\n完成! 共生成 {len(all_entries)} 个 md 文件")
