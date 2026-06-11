@@ -1,0 +1,4 @@
+__pycache__/
+test_db/
+test_docs/
+**/*.pyc

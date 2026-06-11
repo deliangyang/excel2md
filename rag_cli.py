@@ -32,6 +32,9 @@ import warnings
 from pathlib import Path
 from tqdm import tqdm
 
+# jieba 缓存目录（必须在 import jieba 之前设置）
+os.environ.setdefault("JIEBA_CACHE_DIR", os.path.expanduser("~/.cache/jieba"))
+
 # 抑制无关紧要的警告
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -327,6 +330,14 @@ def _jieba_tokenize(text: str) -> list[str]:
     """中文分词：优先 jieba，回退到字符级。"""
     try:
         import jieba
+        import tempfile
+        # 设置 jieba 缓存目录，避免 /tmp 权限问题
+        cache_dir = os.path.expanduser("~/.cache/jieba")
+        os.makedirs(cache_dir, exist_ok=True)
+        jieba.dt.tmp_dir = cache_dir
+        jieba.dt.cache_file = os.path.join(cache_dir, "jieba.cache")
+        # 确保词典已加载
+        jieba.initialize()
         return list(jieba.cut_for_search(text))
     except ImportError:
         return re.findall(r"[\w\u4e00-\u9fff]+", text.lower())
@@ -603,10 +614,10 @@ class RAGEngine:
             candidates = vec_results
             mode = "向量检索"
 
-        # Reranker 精排（使用预加载的模型）
+        # Reranker 精排（使用预加载的模型，无 tqdm）
         if use_reranker and candidates and self.reranker_model:
             pairs = [(query_text, doc.page_content) for doc, _ in candidates]
-            batch_size = 32
+            batch_size = 64  # 更大的 batch size 提升吞吐量
             all_scores = []
 
             for i in range(0, len(pairs), batch_size):
