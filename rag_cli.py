@@ -1,23 +1,27 @@
 #!/usr/bin/python3.10
-"""RAG 向量检索 CLI —— 导入文档 & 语义查询（优化版）
+"""RAG 向量检索 CLI —— 导入文档 & 语义查询 & API 服务（优化版）
 
 优化特性:
   1. 内容哈希去重 —— 相同内容的文档块只保留一份，合并来源路径
   2. Markdown 感知分块 —— 以标题为边界，注入父标题上下文
   3. Reranker 重排序 —— BGE-Reranker-v2-M3 对召回结果精排
   4. 混合检索 (BM25 + 向量) —— RRF 倒数排名融合，互补稀疏/稠密检索
+  5. HTTP API 服务 —— FastAPI 提供 /query 接口，支持 SSE 流式输出
+     · 启动时预加载所有模型和索引，请求时零延迟复用
 
 依赖安装:
   pip install langchain langchain-huggingface langchain-chroma \\
               langchain-text-splitters chromadb sentence-transformers \\
-              rank_bm25
+              rank_bm25 fastapi uvicorn sse-starlette
 
 用法:
-  python rag_cli.py import  <目录路径> [选项]
-  python rag_cli.py query   "查询内容"  [选项]
+  python rag_cli.py import        <目录路径> [选项]
+  python rag_cli.py query         "查询内容"  [选项]
+  python rag_cli.py query-server  [选项]
 """
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -47,13 +51,14 @@ DEFAULT_DB_DIR = "./chroma_db"
 DEFAULT_CHUNK_SIZE = 512
 DEFAULT_CHUNK_OVERLAP = 50
 DEFAULT_TOP_K = 10
-DEFAULT_RECALL_K = 30          # 向量召回数量（rerank 前）
-DEFAULT_BM25_K = 30            # BM25 召回数量
+DEFAULT_RECALL_K = 30
+DEFAULT_BM25_K = 30
 EMBEDDING_MODEL = "BAAI/bge-large-zh-v1.5"
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 BM25_INDEX_FILE = "bm25_index.json"
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 8000
 
-# 支持的文件扩展名 → LangChain Loader 映射
 SUPPORTED_EXTS = {
     ".txt", ".md", ".html", ".htm", ".csv", ".json", ".jsonl",
     ".pdf", ".docx", ".pptx", ".xlsx", ".xls",
@@ -78,6 +83,9 @@ def check_dependencies(extra: list[str] | None = None):
     if extra:
         for mod, pkg in [
             ("rank_bm25", "rank_bm25"),
+            ("fastapi", "fastapi"),
+            ("uvicorn", "uvicorn"),
+            ("sse_starlette", "sse-starlette"),
         ]:
             if mod in extra:
                 deps[mod] = pkg
@@ -128,7 +136,6 @@ def _build_loader_map() -> dict:
         ".sql": TextLoader,
     }
 
-    # 可选：unstructured 系列
     try:
         import unstructured  # noqa: F401
         from langchain_community.document_loaders import (
@@ -140,7 +147,6 @@ def _build_loader_map() -> dict:
     except ImportError:
         pass
 
-    # 可选：Office 文档
     for ext, cls_name in [
         (".docx", "Docx2txtLoader"),
         (".xlsx", "UnstructuredExcelLoader"),
@@ -190,13 +196,9 @@ def load_documents(files: list[str]):
 # ═══════════════════════════════════════════════════════════════
 
 def _extract_md_sections(text: str) -> list[dict]:
-    """将 Markdown 文本按标题拆分为语义段落。
-
-    返回 [{"title": "完整标题链", "body": "段落内容"}, ...]
-    """
+    """将 Markdown 文本按标题拆分为语义段落。"""
     lines = text.split("\n")
     sections = []
-    # 标题栈：level → text，用于构建标题链
     heading_stack: dict[int, str] = {}
     current_body: list[str] = []
 
@@ -204,10 +206,7 @@ def _extract_md_sections(text: str) -> list[dict]:
         nonlocal current_body
         body = "\n".join(current_body).strip()
         if body:
-            # 构建标题链前缀
-            chain = " > ".join(
-                heading_stack[k] for k in sorted(heading_stack)
-            )
+            chain = " > ".join(heading_stack[k] for k in sorted(heading_stack))
             sections.append({"title": chain, "body": body})
         current_body = []
 
@@ -220,7 +219,6 @@ def _extract_md_sections(text: str) -> list[dict]:
             level = len(m.group(1))
             title_text = m.group(2).strip()
             heading_stack[level] = title_text
-            # 清除更低级别的标题
             for k in list(heading_stack):
                 if k > level:
                     del heading_stack[k]
@@ -238,10 +236,7 @@ def _content_hash(text: str) -> str:
 
 
 def split_documents_markdown(docs, chunk_size: int, chunk_overlap: int):
-    """Markdown 感知分块：以标题为边界，注入父标题上下文。
-
-    对 .md 文件使用标题分块；对其他文件回退到 RecursiveCharacterTextSplitter。
-    """
+    """Markdown 感知分块：以标题为边界，注入父标题上下文。"""
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 
     fallback_splitter = RecursiveCharacterTextSplitter(
@@ -262,29 +257,21 @@ def split_documents_markdown(docs, chunk_size: int, chunk_overlap: int):
             sections = _extract_md_sections(doc.page_content)
             if sections:
                 for sec in sections:
-                    # 注入父标题上下文到块开头
                     if sec["title"]:
                         chunk_text = f"【{sec['title']}】\n{sec['body']}"
                     else:
                         chunk_text = sec["body"]
 
-                    # 如果段落超长，再用 fallback 切
                     if len(chunk_text) > chunk_size * 2:
                         sub_docs = fallback_splitter.split_text(chunk_text)
                         for sub in sub_docs:
-                            chunks.append(_make_chunk(
-                                sub, doc.metadata, filename, source,
-                            ))
+                            chunks.append(_make_chunk(sub, doc.metadata, filename, source))
                     else:
-                        chunks.append(_make_chunk(
-                            chunk_text, doc.metadata, filename, source,
-                        ))
+                        chunks.append(_make_chunk(chunk_text, doc.metadata, filename, source))
             else:
-                # 无标题的 md，回退
                 for c in fallback_splitter.split_documents([doc]):
                     chunks.append(c)
         else:
-            # 非 md 文件：用 fallback 切分
             for c in fallback_splitter.split_documents([doc]):
                 chunks.append(c)
 
@@ -305,18 +292,14 @@ def _make_chunk(text, base_meta, filename, source):
 # ═══════════════════════════════════════════════════════════════
 
 def deduplicate_chunks(chunks) -> list:
-    """对文本块做内容哈希去重。
-
-    相同内容的块只保留一份，但合并所有来源路径到 metadata["all_sources"]。
-    """
-    seen: dict[str, int] = {}  # hash → index in result
+    """对文本块做内容哈希去重。"""
+    seen: dict[str, int] = {}
     result = []
     dup_count = 0
 
     for chunk in tqdm(chunks, desc="🔍 内容去重", unit="chunk", ncols=80):
         h = _content_hash(chunk.page_content)
         if h in seen:
-            # 合并来源
             idx = seen[h]
             existing = result[idx]
             existing_sources = existing.metadata.get("all_sources", [])
@@ -346,7 +329,6 @@ def _jieba_tokenize(text: str) -> list[str]:
         import jieba
         return list(jieba.cut_for_search(text))
     except ImportError:
-        # 回退：按字符 + 简单标点切分
         return re.findall(r"[\w\u4e00-\u9fff]+", text.lower())
 
 
@@ -363,7 +345,6 @@ def build_bm25_index(chunks, db_dir: str):
     print(f"📊 构建 BM25 索引 ({len(corpus)} 个文档)...")
     bm25 = BM25Okapi(corpus)
 
-    # 序列化：保存 tokenized corpus 和 chunks 元数据
     index_path = os.path.join(db_dir, BM25_INDEX_FILE)
     index_data = {
         "corpus": corpus,
@@ -406,7 +387,6 @@ def bm25_search(bm25, chunks, query: str, top_k: int) -> list[tuple]:
     tokens = _jieba_tokenize(query)
     scores = bm25.get_scores(tokens)
 
-    # 取 top_k
     top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
     results = []
     for idx in top_indices:
@@ -420,6 +400,7 @@ def bm25_search(bm25, chunks, query: str, top_k: int) -> list[tuple]:
 # ═══════════════════════════════════════════════════════════════
 
 _reranker_cache = {}
+
 
 def get_reranker():
     """加载 BGE Reranker 模型（带缓存）。"""
@@ -440,11 +421,7 @@ def get_reranker():
 
 
 def rerank(query: str, candidates: list[tuple], top_k: int) -> list[tuple]:
-    """使用 Reranker 对候选结果重排序。
-
-    candidates: [(Document, raw_score), ...]
-    返回: [(Document, rerank_score), ...] 按新分数降序
-    """
+    """使用 Reranker 对候选结果重排序。"""
     import torch
 
     model, tokenizer = get_reranker()
@@ -453,7 +430,6 @@ def rerank(query: str, candidates: list[tuple], top_k: int) -> list[tuple]:
     if not pairs:
         return []
 
-    # 分批推理，避免 OOM
     batch_size = 32
     all_scores = []
 
@@ -471,7 +447,6 @@ def rerank(query: str, candidates: list[tuple], top_k: int) -> list[tuple]:
                 scores = [scores]
             all_scores.extend(scores)
 
-    # 组合并排序
     reranked = list(zip([doc for doc, _ in candidates], all_scores))
     reranked.sort(key=lambda x: x[1], reverse=True)
     return reranked[:top_k]
@@ -489,13 +464,7 @@ def rrf_fusion(
     vec_weight: float = 0.7,
     bm25_weight: float = 0.3,
 ) -> list[tuple]:
-    """Reciprocal Rank Fusion 合并向量和 BM25 结果。
-
-    k: RRF 常数（默认 60）
-    vec_weight / bm25_weight: 两路权重
-    返回: [(Document, fused_score), ...]
-    """
-    # 文档去重 key → (doc, score)
+    """Reciprocal Rank Fusion 合并向量和 BM25 结果。"""
     fused: dict[str, tuple] = {}
 
     for rank, (doc, score) in enumerate(vec_results):
@@ -521,7 +490,7 @@ def rrf_fusion(
 
 
 # ═══════════════════════════════════════════════════════════════
-# 查询时去重（按内容哈希）
+# 查询时去重
 # ═══════════════════════════════════════════════════════════════
 
 def deduplicate_results(results: list[tuple], top_k: int) -> list[tuple]:
@@ -547,13 +516,148 @@ def get_embeddings():
     print(f"📦 加载嵌入模型: {EMBEDDING_MODEL}")
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
-        model_kwargs={"device": "cpu"},  # 可改为 "cuda" 使用 GPU
+        model_kwargs={"device": "cpu"},
         encode_kwargs={"normalize_embeddings": True},
     )
     return embeddings
 
 
-# ─────────────────── 子命令: import ───────────────────
+# ═══════════════════════════════════════════════════════════════
+# RAG 引擎：启动时预加载所有资源，请求时复用
+# ═══════════════════════════════════════════════════════════════
+
+class RAGEngine:
+    """RAG 检索引擎 —— 启动时预加载模型和索引，请求时零延迟复用。"""
+
+    def __init__(self, db_dir: str):
+        self.db_dir = os.path.abspath(db_dir)
+        if not os.path.isdir(self.db_dir):
+            raise FileNotFoundError(f"向量库不存在: {self.db_dir}")
+
+        self.embeddings = None
+        self.vectorstore = None
+        self.bm25 = None
+        self.bm25_chunks = None
+        self.reranker_model = None
+        self.reranker_tokenizer = None
+
+    def load(self, load_bm25: bool = True, load_reranker: bool = True):
+        """预加载所有资源。"""
+        from langchain_chroma import Chroma
+
+        print(f"\n🚀 预加载 RAG 引擎资源...")
+        t0 = time.time()
+
+        # 1. 嵌入模型
+        self.embeddings = get_embeddings()
+
+        # 2. 向量库
+        print(f"📂 加载向量库: {self.db_dir}")
+        self.vectorstore = Chroma(
+            persist_directory=self.db_dir,
+            embedding_function=self.embeddings,
+        )
+
+        # 3. BM25 索引
+        if load_bm25:
+            self.bm25, _, self.bm25_chunks = load_bm25_index(self.db_dir)
+            if self.bm25:
+                print(f"📊 BM25 索引已加载 ({len(self.bm25_chunks)} 个文档)")
+            else:
+                print("⚠ BM25 索引不存在")
+
+        # 4. Reranker 模型
+        if load_reranker:
+            self.reranker_model, self.reranker_tokenizer = get_reranker()
+
+        elapsed = time.time() - t0
+        print(f"✅ 资源预加载完成，耗时 {elapsed:.1f}s\n")
+
+    def query(
+        self,
+        query_text: str,
+        top_k: int = DEFAULT_TOP_K,
+        recall_k: int = DEFAULT_RECALL_K,
+        use_reranker: bool = True,
+        use_bm25: bool = True,
+    ) -> dict:
+        """执行查询 —— 使用预加载的资源，无需重复加载。"""
+        import torch
+
+        t0 = time.time()
+
+        # 向量检索
+        vec_results = self.vectorstore.similarity_search_with_score(query_text, k=recall_k)
+        vec_results = [(doc, max(0.0, 1.0 - score / 2.0)) for doc, score in vec_results]
+
+        # BM25 检索
+        bm25_results = []
+        if use_bm25 and self.bm25:
+            bm25_results = bm25_search(self.bm25, self.bm25_chunks, query_text, recall_k)
+
+        # 融合
+        if use_bm25 and bm25_results:
+            candidates = rrf_fusion(vec_results, bm25_results, top_k=recall_k)
+            mode = "混合检索(BM25+向量)+RRF"
+        else:
+            candidates = vec_results
+            mode = "向量检索"
+
+        # Reranker 精排（使用预加载的模型）
+        if use_reranker and candidates and self.reranker_model:
+            pairs = [(query_text, doc.page_content) for doc, _ in candidates]
+            batch_size = 32
+            all_scores = []
+
+            for i in range(0, len(pairs), batch_size):
+                batch = pairs[i:i + batch_size]
+                with torch.no_grad():
+                    inputs = self.reranker_tokenizer(
+                        batch, padding=True, truncation=True,
+                        max_length=512, return_tensors="pt",
+                    )
+                    logits = self.reranker_model(**inputs).logits.squeeze(-1)
+                    scores = logits.tolist()
+                    if isinstance(scores, float):
+                        scores = [scores]
+                    all_scores.extend(scores)
+
+            reranked = list(zip([doc for doc, _ in candidates], all_scores))
+            reranked.sort(key=lambda x: x[1], reverse=True)
+            final_results = reranked[:top_k]
+            mode += " → Reranker精排"
+        else:
+            final_results = candidates[:top_k]
+
+        # 结果去重
+        final_results = deduplicate_results(final_results, top_k)
+
+        elapsed = time.time() - t0
+
+        # 结构化输出
+        results = []
+        for i, (doc, score) in enumerate(final_results, 1):
+            results.append({
+                "rank": i,
+                "score": round(score, 4),
+                "content": doc.page_content.strip(),
+                "source": doc.metadata.get("filename", "未知"),
+                "path": doc.metadata.get("source", ""),
+                "all_sources": doc.metadata.get("all_sources", []),
+            })
+
+        return {
+            "query": query_text,
+            "mode": mode,
+            "elapsed": round(elapsed, 2),
+            "total": len(results),
+            "results": results,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# CLI: 导入子命令
+# ═══════════════════════════════════════════════════════════════
 
 def cmd_import(args):
     """导入子命令：加载 → 切分 → 去重 → 嵌入 → 存入 Chroma + BM25。"""
@@ -566,28 +670,23 @@ def cmd_import(args):
 
     db_dir = os.path.abspath(args.db)
 
-    # 1. 发现文件
     print(f"🔍 扫描目录: {root}")
     files = discover_files(root)
     if not files:
         sys.exit(f"❌ 未找到任何支持的文件 (支持: {', '.join(sorted(SUPPORTED_EXTS))})")
     print(f"   找到 {len(files)} 个文件")
 
-    # 2. 加载文档
     docs = load_documents(files)
     if not docs:
         sys.exit("❌ 未能加载任何文档内容")
     print(f"   加载了 {len(docs)} 个文档片段")
 
-    # 3. Markdown 感知分块（优化 2）
     print(f"✂️  切分文本 (chunk_size={args.chunk_size}, overlap={args.chunk_overlap})...")
     chunks = split_documents_markdown(docs, args.chunk_size, args.chunk_overlap)
     print(f"   切分为 {len(chunks)} 个块")
 
-    # 4. 内容哈希去重（优化 1）
     chunks = deduplicate_chunks(chunks)
 
-    # 5. 嵌入 & 持久化
     embeddings = get_embeddings()
     print(f"💾 写入向量库: {db_dir}")
     t0 = time.time()
@@ -608,121 +707,220 @@ def cmd_import(args):
         else:
             vectorstore.add_documents(batch)
 
-    # 6. 构建 BM25 索引（优化 4）
     build_bm25_index(chunks, db_dir)
 
     elapsed = time.time() - t0
     print(f"\n✅ 完成! 共索引 {len(chunks)} 个文本块，耗时 {elapsed:.1f}s")
     print(f"   向量库路径: {db_dir}")
-    print(f"   检索模式: 混合检索 (BM25 + 向量)" + (" + Reranker" if not args.no_rerank else ""))
 
 
-# ─────────────────── 子命令: query ───────────────────
+# ═══════════════════════════════════════════════════════════════
+# CLI: 查询子命令
+# ═══════════════════════════════════════════════════════════════
 
 def cmd_query(args):
-    """查询子命令：混合检索 → RRF 融合 → Reranker 精排 → 去重 → Top-K。"""
+    """查询子命令：创建引擎 → 加载资源 → 查询 → 格式化输出。"""
     check_dependencies()
-    from langchain_chroma import Chroma
-
-    db_dir = os.path.abspath(args.db)
-    if not os.path.isdir(db_dir):
-        sys.exit(f"❌ 向量库不存在: {db_dir}\n   请先运行 import 子命令导入数据")
 
     query_text = args.query.strip()
     if not query_text:
         sys.exit("❌ 查询内容不能为空")
 
-    top_k = args.top_k
-    recall_k = args.recall_k
+    db_dir = os.path.abspath(args.db)
     use_reranker = not args.no_reranker
     use_bm25 = not args.no_bm25
 
-    # 1. 加载嵌入模型
-    embeddings = get_embeddings()
+    print(f"🔎 查询: {query_text}")
+    print(f"   返回 Top-{args.top_k}\n")
 
-    # 2. 加载向量库
-    print(f"📂 加载向量库: {db_dir}")
-    vectorstore = Chroma(
-        persist_directory=db_dir,
-        embedding_function=embeddings,
-    )
+    try:
+        engine = RAGEngine(db_dir)
+        engine.load(load_bm25=use_bm25, load_reranker=use_reranker)
+        data = engine.query(
+            query_text=query_text,
+            top_k=args.top_k,
+            recall_k=args.recall_k,
+            use_reranker=use_reranker,
+            use_bm25=use_bm25,
+        )
+    except FileNotFoundError as e:
+        sys.exit(f"❌ {e}\n   请先运行 import 子命令导入数据")
 
-    # 3. 加载 BM25 索引
-    bm25, bm25_corpus, bm25_chunks = None, None, None
-    if use_bm25:
-        bm25, bm25_corpus, bm25_chunks = load_bm25_index(db_dir)
-        if bm25:
-            print(f"📊 BM25 索引已加载 ({len(bm25_chunks)} 个文档)")
-        else:
-            print("⚠ BM25 索引不存在，仅使用向量检索")
-            use_bm25 = False
-
-    # 4. 执行检索
-    print(f"\n🔎 查询: {query_text}")
-    print(f"   返回 Top-{top_k}")
-    t0 = time.time()
-
-    # ── 4a. 向量检索 ──
-    vec_results = vectorstore.similarity_search_with_score(query_text, k=recall_k)
-    # Chroma L2 距离 → 相似度（越小越相似）
-    vec_results = [(doc, max(0.0, 1.0 - score / 2.0)) for doc, score in vec_results]
-    print(f"   向量召回: {len(vec_results)} 条")
-
-    # ── 4b. BM25 检索 ──
-    bm25_results = []
-    if use_bm25 and bm25:
-        bm25_results = bm25_search(bm25, bm25_chunks, query_text, recall_k)
-        print(f"   BM25 召回: {len(bm25_results)} 条")
-
-    # ── 5. 融合策略 ──
-    if use_bm25 and bm25_results:
-        # RRF 融合
-        print("   融合策略: RRF 倒数排名融合")
-        candidates = rrf_fusion(vec_results, bm25_results, top_k=recall_k)
-    else:
-        candidates = vec_results
-
-    # ── 6. Reranker 精排 ──
-    if use_reranker and candidates:
-        print(f"   重排序: {RERANKER_MODEL}")
-        final_results = rerank(query_text, candidates, top_k=top_k)
-    else:
-        final_results = candidates[:top_k]
-
-    # ── 7. 结果去重 ──
-    final_results = deduplicate_results(final_results, top_k)
-
-    elapsed = time.time() - t0
-
-    # ── 输出 ──
     print(f"\n{'='*70}")
-    mode_parts = []
-    if use_bm25 and bm25_results:
-        mode_parts.append("混合检索(BM25+向量)+RRF")
-    else:
-        mode_parts.append("向量检索")
-    if use_reranker:
-        mode_parts.append("Reranker精排")
-    mode_str = " → ".join(mode_parts)
-    print(f"检索完成 [{mode_str}]，共 {len(final_results)} 条结果，耗时 {elapsed:.2f}s")
+    print(f"检索完成 [{data['mode']}]，共 {data['total']} 条结果，耗时 {data['elapsed']:.2f}s")
     print(f"{'='*70}\n")
 
-    for i, (doc, score) in enumerate(final_results, 1):
-        source = doc.metadata.get("filename", "未知")
-        source_path = doc.metadata.get("source", "")
-        all_sources = doc.metadata.get("all_sources", [])
-
-        print(f"─── [{i}] 得分: {score:.4f} ───")
-        print(f"    来源: {source}")
-        if source_path:
-            print(f"    路径: {source_path}")
-        if len(all_sources) > 1:
-            print(f"    其他来源: {', '.join(os.path.basename(s) for s in all_sources[1:])}")
+    for item in data["results"]:
+        print(f"─── [{item['rank']}] 得分: {item['score']:.4f} ───")
+        print(f"    来源: {item['source']}")
+        if item["path"]:
+            print(f"    路径: {item['path']}")
+        if len(item["all_sources"]) > 1:
+            others = [os.path.basename(s) for s in item["all_sources"][1:]]
+            print(f"    其他来源: {', '.join(others)}")
         print(f"    内容:")
-        content = doc.page_content.strip()
-        for line in content.split("\n"):
+        for line in item["content"].split("\n"):
             print(f"      {line}")
         print()
+
+
+# ═══════════════════════════════════════════════════════════════
+# CLI: query-server 子命令
+# ═══════════════════════════════════════════════════════════════
+
+def cmd_query_server(args):
+    """启动 HTTP API 服务 —— 启动时预加载所有资源，请求时直接复用。"""
+    check_dependencies(extra=["fastapi", "uvicorn", "sse_starlette"])
+
+    from fastapi import FastAPI, HTTPException
+    from fastapi.middleware.cors import CORSMiddleware
+    from pydantic import BaseModel, Field
+    from sse_starlette.sse import EventSourceResponse
+    import uvicorn
+
+    db_dir = os.path.abspath(args.db)
+    if not os.path.isdir(db_dir):
+        sys.exit(f"❌ 向量库不存在: {db_dir}\n   请先运行 import 子命令导入数据")
+
+    # ═══════════════════════════════════════════════════════════
+    # 启动时预加载所有资源（只做一次）
+    # ═══════════════════════════════════════════════════════════
+    print(f"\n{'='*70}")
+    print("🚀 RAG Query API Server 启动中...")
+    print(f"{'='*70}")
+
+    engine = RAGEngine(db_dir)
+    engine.load(load_bm25=True, load_reranker=True)
+
+    # ═══════════════════════════════════════════════════════════
+    # FastAPI 应用
+    # ═══════════════════════════════════════════════════════════
+    app = FastAPI(
+        title="RAG Query API",
+        description="向量检索 API 服务，支持混合检索 + Reranker 精排",
+        version="1.0.0",
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # ── 请求模型 ──
+    class QueryRequest(BaseModel):
+        query: str = Field(..., description="查询内容", min_length=1)
+        top_k: int = Field(DEFAULT_TOP_K, ge=1, le=100, description="返回结果数量")
+        recall_k: int = Field(DEFAULT_RECALL_K, ge=1, le=200, description="召回数量")
+        use_reranker: bool = Field(True, description="是否使用 Reranker 精排")
+        use_bm25: bool = Field(True, description="是否使用 BM25 检索")
+        stream: bool = Field(False, description="是否使用 SSE 流式输出")
+
+    class QueryResult(BaseModel):
+        rank: int
+        score: float
+        content: str
+        source: str
+        path: str
+        all_sources: list[str]
+
+    class QueryResponse(BaseModel):
+        query: str
+        mode: str
+        elapsed: float
+        total: int
+        results: list[QueryResult]
+
+    # ── 健康检查 ──
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "ok",
+            "db_dir": db_dir,
+            "bm25_loaded": engine.bm25 is not None,
+            "reranker_loaded": engine.reranker_model is not None,
+        }
+
+    # ── 查询接口 ──
+    @app.post("/query", response_model=QueryResponse)
+    async def query(req: QueryRequest):
+        """执行向量检索，返回 Top-K 结果。
+
+        - 默认返回 JSON 格式结果
+        - 设置 stream=true 返回 SSE 流式响应
+        """
+        try:
+            if req.stream:
+                # SSE 流式输出
+                async def event_generator():
+                    loop = asyncio.get_running_loop()
+                    data = await loop.run_in_executor(
+                        None,
+                        lambda: engine.query(
+                            query_text=req.query,
+                            top_k=req.top_k,
+                            recall_k=req.recall_k,
+                            use_reranker=req.use_reranker,
+                            use_bm25=req.use_bm25,
+                        )
+                    )
+
+                    yield {
+                        "event": "meta",
+                        "data": json.dumps({
+                            "query": data["query"],
+                            "mode": data["mode"],
+                            "elapsed": data["elapsed"],
+                            "total": data["total"],
+                        }, ensure_ascii=False)
+                    }
+
+                    for item in data["results"]:
+                        yield {
+                            "event": "result",
+                            "data": json.dumps(item, ensure_ascii=False)
+                        }
+
+                    yield {
+                        "event": "done",
+                        "data": json.dumps({"status": "completed"})
+                    }
+
+                return EventSourceResponse(event_generator())
+            else:
+                # 普通 JSON 响应 —— 直接使用预加载的引擎，无需重新加载
+                data = engine.query(
+                    query_text=req.query,
+                    top_k=req.top_k,
+                    recall_k=req.recall_k,
+                    use_reranker=req.use_reranker,
+                    use_bm25=req.use_bm25,
+                )
+                return data
+
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+    # ── 启动服务 ──
+    host = args.host
+    port = args.port
+    print(f"\n🌐 服务地址: http://{host}:{port}")
+    print(f"   API 文档: http://{host}:{port}/docs")
+    print(f"   健康检查: GET http://{host}:{port}/health")
+    print(f"\n示例请求:")
+    print(f"  curl -X POST http://localhost:{port}/query \\")
+    print(f'    -H "Content-Type: application/json" \\')
+    print(f"    -d '{{\"query\": \"查询内容\", \"top_k\": 10}}'")
+    print(f"\n流式请求:")
+    print(f"  curl -N -X POST http://localhost:{port}/query \\")
+    print(f'    -H "Content-Type: application/json" \\')
+    print(f"    -d '{{\"query\": \"查询内容\", \"stream\": true}}'")
+    print(f"\n{'='*70}\n")
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 # ─────────────────── 主入口 ───────────────────
@@ -784,6 +982,24 @@ def main():
         help="禁用 BM25 检索，仅使用向量检索",
     )
 
+    # ── query-server 子命令 ──
+    p_server = subparsers.add_parser(
+        "query-server",
+        help="启动 HTTP API 服务，提供 /query 接口（支持 SSE 流式输出）",
+    )
+    p_server.add_argument(
+        "--db", default=DEFAULT_DB_DIR,
+        help=f"向量库路径 (默认: {DEFAULT_DB_DIR})",
+    )
+    p_server.add_argument(
+        "--host", default=DEFAULT_HOST,
+        help=f"监听地址 (默认: {DEFAULT_HOST})",
+    )
+    p_server.add_argument(
+        "--port", type=int, default=DEFAULT_PORT,
+        help=f"监听端口 (默认: {DEFAULT_PORT})",
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -794,6 +1010,8 @@ def main():
         cmd_import(args)
     elif args.command == "query":
         cmd_query(args)
+    elif args.command == "query-server":
+        cmd_query_server(args)
 
 
 if __name__ == "__main__":
